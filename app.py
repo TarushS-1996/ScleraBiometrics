@@ -3,121 +3,183 @@ import os
 import cv2
 import requests
 import numpy as np
+from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QTabWidget,
-    QVBoxLayout, QHBoxLayout, QFileDialog, QLineEdit, QComboBox
+    QVBoxLayout, QHBoxLayout, QFileDialog, QLineEdit,
+    QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QGridLayout
 )
 from PyQt6.QtGui import QPixmap, QImage
-from PyQt6.QtCore import Qt, QTimer   # ✅ QTimer goes here
+from PyQt6.QtCore import Qt, QTimer
 
+# -------------------------
+# CONFIG
+# -------------------------
 API_BASE = "http://127.0.0.1:8000"
 
-
-# ---------------------------------
-# Utility: numpy → QPixmap
-# ---------------------------------
+# -------------------------
+# Utils
+# -------------------------
 def np_to_pixmap(img):
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     h, w, c = img.shape
     bytes_per_line = c * w
-    qimg = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+    qimg = QImage(
+        img.data, w, h, bytes_per_line,
+        QImage.Format.Format_RGB888
+    )
     return QPixmap.fromImage(qimg)
 
+def sharpness(img):
+    return cv2.Laplacian(img, cv2.CV_64F).var()
 
-# ---------------------------------------------------------
-# Main Application
-# ---------------------------------------------------------
+# =========================================================
+# Main App
+# =========================================================
 class ScleraApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Sclera Vein Identity Matcher")
-        self.setGeometry(100, 100, 900, 600)
+        self.setWindowTitle("Sclera Vein Identity System")
+        self.setGeometry(100, 100, 1200, 700)
+
+        self.records = []
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.add_user_tab(), "Add User")
-        self.tabs.addTab(self.verify_tab(), "Verify User")
+        self.tabs.addTab(self.capture_tab(), "Capture / Match / Register")
+        self.tabs.addTab(self.records_tab(), "Records")
 
         layout = QVBoxLayout()
         layout.addWidget(self.tabs)
         self.setLayout(layout)
 
-    # ---------------------------------------------------------
-    # TAB 1: Add User (calls /segment)
-    # ---------------------------------------------------------
-    def add_user_tab(self):
+    # =====================================================
+    # TAB 1 — CAPTURE / MATCH / REGISTER
+    # =====================================================
+    def capture_tab(self):
         tab = QWidget()
-        layout = QVBoxLayout()
+        grid = QGridLayout()
+        grid.setSpacing(20)
+        grid.setContentsMargins(30, 30, 30, 30)
 
-        # --------------------
-        # Inputs
-        # --------------------
+        # =========================
+        # CAMERA PANEL (Top Left)
+        # =========================
+        cam_panel = QVBoxLayout()
+        cam_panel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        cam_title = QLabel("Live Camera")
+        cam_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cam_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+
+        self.camera_selector = QComboBox()
+        self.cameras = self.list_cameras()
+        for c in self.cameras:
+            self.camera_selector.addItem(f"Camera {c}", c)
+        self.camera_selector.currentIndexChanged.connect(self.switch_camera)
+
+        self.video_label = QLabel()
+        self.video_label.setFixedSize(480, 320)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setStyleSheet(
+            "background-color: #111; border: 1px solid #444;"
+        )
+
+        cam_panel.addWidget(cam_title)
+        cam_panel.addWidget(self.camera_selector)
+        cam_panel.addWidget(self.video_label)
+
+        # =========================
+        # PREVIEW PANEL (Top Right)
+        # =========================
+        preview_panel = QVBoxLayout()
+        preview_panel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        preview_title = QLabel("Captured / Preview")
+        preview_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+
+        self.preview_label = QLabel()
+        self.preview_label.setFixedSize(480, 320)
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setStyleSheet(
+            "background-color: #111; border: 1px solid #444;"
+        )
+
+        preview_panel.addWidget(preview_title)
+        preview_panel.addWidget(self.preview_label)
+
+        # =========================
+        # CAPTURE CONTROLS (Bottom Left)
+        # =========================
+        capture_controls = QVBoxLayout()
+        capture_controls.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.btn_capture = QPushButton("📸 Take Picture")
+        self.btn_capture.setFixedHeight(40)
+        self.btn_capture.clicked.connect(self.capture_image)
+
+        self.btn_load = QPushButton("🖼 Load Image")
+        self.btn_load.setFixedHeight(40)
+        self.btn_load.clicked.connect(self.load_image)
+
+        capture_controls.addWidget(self.btn_capture)
+        capture_controls.addWidget(self.btn_load)
+
+        # =========================
+        # ACTIONS PANEL (Bottom Right)
+        # =========================
+        action_panel = QVBoxLayout()
+        action_panel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         self.user_input = QLineEdit()
-        self.user_input.setPlaceholderText("Enter User ID")
+        self.user_input.setPlaceholderText("User ID")
+        self.user_input.setFixedHeight(36)
 
         self.eye_selector = QComboBox()
         self.eye_selector.addItems(["Left", "Right"])
+        self.eye_selector.setFixedHeight(36)
 
-        # --------------------
-        # Camera selector
-        # --------------------
-        self.camera_selector = QComboBox()
-        self.available_cameras = self.list_available_cameras()
-        for cam in self.available_cameras:
-            self.camera_selector.addItem(f"Camera {cam}", cam)
-        self.camera_selector.currentIndexChanged.connect(self.switch_camera)
+        self.btn_match = QPushButton("🔍 MATCH")
+        self.btn_match.setFixedHeight(45)
+        self.btn_match.clicked.connect(self.call_identify)
 
-        # --------------------
-        # Live video label
-        # --------------------
-        self.video_label = QLabel("Camera Feed")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setFixedSize(400, 300)
+        self.btn_register = QPushButton("📝 REGISTER")
+        self.btn_register.setFixedHeight(45)
+        self.btn_register.clicked.connect(self.call_register)
 
-        # --------------------
-        # Buttons
-        # --------------------
-        btn_row = QHBoxLayout()
+        self.status_label = QLabel("Ready")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setWordWrap(True)
 
-        capture_btn = QPushButton("📸 Take Picture")
-        capture_btn.clicked.connect(self.capture_frame)
+        action_panel.addWidget(self.user_input)
+        action_panel.addWidget(self.eye_selector)
+        action_panel.addWidget(self.btn_match)
+        action_panel.addWidget(self.btn_register)
+        action_panel.addWidget(self.status_label)
 
-        load_btn = QPushButton("🖼 Load Image")
-        load_btn.clicked.connect(self.load_new_image)
+        # =========================
+        # ADD TO GRID
+        # =========================
+        grid.addLayout(cam_panel, 0, 0)
+        grid.addLayout(preview_panel, 0, 1)
+        grid.addLayout(capture_controls, 1, 0)
+        grid.addLayout(action_panel, 1, 1)
 
-        send_btn = QPushButton("🚀 Send to Backend")
-        send_btn.clicked.connect(self.send_to_segment_api)
+        tab.setLayout(grid)
 
-        btn_row.addWidget(capture_btn)
-        btn_row.addWidget(load_btn)
-        btn_row.addWidget(send_btn)
-
-        # --------------------
-        # Status
-        # --------------------
-        self.add_user_status = QLabel("Ready")
-        self.add_user_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        # --------------------
-        # Layout
-        # --------------------
-        layout.addWidget(self.user_input)
-        layout.addWidget(self.eye_selector)
-        layout.addWidget(self.camera_selector)
-        layout.addWidget(self.video_label)
-        layout.addLayout(btn_row)
-        layout.addWidget(self.add_user_status)
-
-        tab.setLayout(layout)
-
-        # Start first camera
-        if self.available_cameras:
-            self.start_camera(self.available_cameras[0])
+        # Start camera
+        if self.cameras:
+            self.start_camera(self.cameras[0])
 
         return tab
-    
-    def list_available_cameras(self, max_devices=10):
+
+
+    # =====================================================
+    # CAMERA LOGIC
+    # =====================================================
+    def list_cameras(self, max_devices=5):
         cams = []
         for i in range(max_devices):
             cap = cv2.VideoCapture(i)
@@ -125,172 +187,151 @@ class ScleraApp(QWidget):
                 cams.append(i)
                 cap.release()
         return cams
-    
-    def start_camera(self, cam_index):
-        self.cap = cv2.VideoCapture(cam_index)
+
+    def start_camera(self, index):
+        self.cap = cv2.VideoCapture(index)
         self.timer = QTimer()
-        self.timer.timeout.connect(self.update_camera_frame)
+        self.timer.timeout.connect(self.update_frame)
         self.timer.start(30)
 
     def switch_camera(self):
-        cam_index = self.camera_selector.currentData()
-        self.stop_camera()
-        self.start_camera(cam_index)
+        self.timer.stop()
+        self.cap.release()
+        cam = self.camera_selector.currentData()
+        self.start_camera(cam)
 
-    def stop_camera(self):
-        if hasattr(self, "timer"):
-            self.timer.stop()
-        if hasattr(self, "cap") and self.cap.isOpened():
-            self.cap.release()
-
-    def update_camera_frame(self):
+    def update_frame(self):
         ret, frame = self.cap.read()
         if not ret:
             return
         self.current_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pix = np_to_pixmap(self.current_frame)
         self.video_label.setPixmap(
-            pix.scaled(400, 300, Qt.AspectRatioMode.KeepAspectRatio)
+            np_to_pixmap(self.current_frame).scaled(
+                480, 360, Qt.AspectRatioMode.KeepAspectRatio
+            )
         )
 
-    def capture_frame(self):
-        if hasattr(self, "current_frame"):
-            self.frozen_frame = self.current_frame.copy()
-            self.timer.stop()
-            self.video_label.setPixmap(
-                np_to_pixmap(self.frozen_frame).scaled(400,300, Qt.AspectRatioMode.KeepAspectRatio)
+    def capture_image(self):
+        best = None
+        best_score = 0
+        for _ in range(5):
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+            s = sharpness(frame)
+            if s > best_score:
+                best = frame
+                best_score = s
+
+        if best is not None:
+            self.captured = cv2.cvtColor(best, cv2.COLOR_BGR2RGB)
+            self.preview_label.setPixmap(
+                np_to_pixmap(self.captured).scaled(
+                    480, 360, Qt.AspectRatioMode.KeepAspectRatio
+                )
             )
-            self.add_user_status.setText("📸 Image captured")
+            self.status_label.setText("Image captured (sharpest frame)")
 
-
-    def load_new_image(self):
+    def load_image(self):
         fname, _ = QFileDialog.getOpenFileName(
-            self, "Select Eye Image", "", "Images (*.png *.jpg *.jpeg)"
+            self, "Load Image", "", "Images (*.jpg *.png *.jpeg)"
         )
         if fname:
             img = cv2.cvtColor(cv2.imread(fname), cv2.COLOR_BGR2RGB)
-            self.frozen_frame = img
-            self.video_label.setPixmap(
-                np_to_pixmap(img).scaled(400,300, Qt.AspectRatioMode.KeepAspectRatio)
+            self.captured = img
+            self.preview_label.setPixmap(
+                np_to_pixmap(img).scaled(
+                    480, 360, Qt.AspectRatioMode.KeepAspectRatio
+                )
             )
-            self.timer.stop()
-            self.add_user_status.setText("🖼 Image loaded")
+            self.status_label.setText("Image loaded")
 
-
-    def send_to_segment_api(self):
-        user_id = self.user_input.text().strip()
-        eye_side = self.eye_selector.currentText()
-
-        if not user_id or not hasattr(self, "frozen_frame"):
-            self.add_user_status.setText("❌ Missing user ID or image")
+    # =====================================================
+    # API CALLS
+    # =====================================================
+    def call_register(self):
+        if not hasattr(self, "captured"):
+            self.status_label.setText("❌ No image")
             return
 
-        _, buf = cv2.imencode(
-            ".jpg",
-            cv2.cvtColor(self.frozen_frame, cv2.COLOR_RGB2BGR)
-        )
+        user = self.user_input.text().strip()
+        eye = self.eye_selector.currentText()
+        if not user:
+            self.status_label.setText("❌ User ID required")
+            return
 
+        _, buf = cv2.imencode(".jpg", cv2.cvtColor(self.captured, cv2.COLOR_RGB2BGR))
         files = {"image": ("capture.jpg", buf.tobytes(), "image/jpeg")}
-        data = {"user_id": user_id, "eye_side": eye_side}
+        data = {"user_id": user, "eye_side": eye}
 
         r = requests.post(f"{API_BASE}/segment", files=files, data=data)
 
-        if r.status_code == 200:
-            self.add_user_status.setText("✅ User image stored")
-            self.timer.start(30)  # Resume live camera
-        else:
-            self.add_user_status.setText("❌ Backend failed")
+        self.log_record("REGISTER", user, 1.0 if r.status_code == 200 else 0.0)
 
+        self.status_label.setText(
+            "✅ Registered" if r.status_code == 200 else "❌ Registration failed"
+        )
 
-    # ---------------------------------------------------------
-    # TAB 2: Verify User (calls /compare)
-    # ---------------------------------------------------------
-    def verify_tab(self):
+    def call_identify(self):
+        if not hasattr(self, "captured"):
+            self.status_label.setText("❌ No image")
+            return
+
+        _, buf = cv2.imencode(".jpg", cv2.cvtColor(self.captured, cv2.COLOR_RGB2BGR))
+        files = {"image": ("query.jpg", buf.tobytes(), "image/jpeg")}
+
+        r = requests.post(f"{API_BASE}/identify", files=files)
+
+        if r.status_code != 200:
+            self.status_label.setText("❌ Identification failed")
+            return
+
+        matches = r.json().get("matches", [])
+        if not matches:
+            self.status_label.setText("No matches found")
+            return
+
+        best = matches[0]
+        self.status_label.setText(
+            f"BEST MATCH: {best['name']} | Similarity: {best['similarity']:.3f}"
+        )
+
+        self.log_record("MATCH", best["name"], best["similarity"])
+
+    # =====================================================
+    # TAB 2 — RECORDS
+    # =====================================================
+    def records_tab(self):
         tab = QWidget()
         layout = QVBoxLayout()
 
-        self.compare_label = QLabel("No image loaded")
-        self.compare_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Time", "Action", "User / Match", "Similarity"]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
 
-        self.result_label = QLabel("Results will appear here")
-        self.result_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.result_label.setWordWrap(True)
-
-        load_btn = QPushButton("Load Image to Identify")
-        load_btn.clicked.connect(self.load_compare_image)
-
-        infer_btn = QPushButton("Identify Across Database")
-        infer_btn.clicked.connect(self.call_identify_api)
-
-        layout.addWidget(self.compare_label)
-        layout.addWidget(load_btn)
-        layout.addWidget(infer_btn)
-        layout.addWidget(self.result_label)
-
+        layout.addWidget(self.table)
         tab.setLayout(layout)
         return tab
 
-    def load_compare_image(self):
-        fname, _ = QFileDialog.getOpenFileName(
-            self, "Select Eye Image", "", "Images (*.png *.jpg *.jpeg)"
-        )
-        if fname:
-            self.compare_img_path = fname
-            img = cv2.cvtColor(cv2.imread(fname), cv2.COLOR_BGR2RGB)
-            self.compare_label.setPixmap(
-                np_to_pixmap(img).scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio)
-            )
-            self.result_label.setText("Image loaded. Ready to identify.")
+    def log_record(self, action, name, similarity):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
 
-    def call_identify_api(self):
-        if not hasattr(self, "compare_img_path"):
-            self.result_label.setText("❌ No image selected")
-            return
-
-        try:
-            with open(self.compare_img_path, "rb") as f:
-                files = {"image": f}
-                r = requests.post(f"{API_BASE}/identify", files=files)
-
-            if r.status_code != 200:
-                self.result_label.setText("❌ Identification failed")
-                return
-
-            res = r.json()
-            matches = res.get("matches", [])
-
-            if not matches:
-                self.result_label.setText("❌ No matching eyes found")
-                return
-
-            # ----------------------------
-            # Display results
-            # ----------------------------
-            best = matches[0]
-            text = (
-                f"✅ BEST MATCH\n\n"
-                f"Name: {best['name']}\n"
-                f"Similarity: {best['similarity']:.4f}\n"
-                f"Distance: {best['distance']:.4f}\n\n"
-            )
-
-            if len(matches) > 1:
-                text += "Other matches:\n"
-                for m in matches[1:]:
-                    text += f"- {m['name']} ({m['similarity']:.4f})\n"
-
-            self.result_label.setText(text)
-
-        except Exception as e:
-            self.result_label.setText(f"❌ Error: {str(e)}")
+        self.table.setItem(row, 0, QTableWidgetItem(datetime.now().strftime("%H:%M:%S")))
+        self.table.setItem(row, 1, QTableWidgetItem(action))
+        self.table.setItem(row, 2, QTableWidgetItem(name))
+        self.table.setItem(row, 3, QTableWidgetItem(f"{similarity:.3f}"))
 
 
-
-# ---------------------------------------------------------
-# Run App
-# ---------------------------------------------------------
+# =====================================================
+# RUN
+# =====================================================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = ScleraApp()
-    window.show()
+    win = ScleraApp()
+    win.show()
     sys.exit(app.exec())
