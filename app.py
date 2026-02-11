@@ -194,6 +194,31 @@ class ScleraApp(QWidget):
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(30)
 
+    def pause_camera(self):
+        if hasattr(self, "timer") and self.timer and self.timer.isActive():
+            try:
+                self.timer.stop()
+            except Exception:
+                pass
+        if hasattr(self, "cap") and self.cap:
+            try:
+                if hasattr(self.cap, "release"):
+                    self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+    def resume_camera(self):
+        if getattr(self, "cameras", None):
+            cam = None
+            try:
+                cam = self.camera_selector.currentData()
+            except Exception:
+                pass
+            if cam is None:
+                cam = self.cameras[0]
+            self.start_camera(cam)
+
     def switch_camera(self):
         self.timer.stop()
         self.cap.release()
@@ -207,7 +232,7 @@ class ScleraApp(QWidget):
         self.current_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.video_label.setPixmap(
             np_to_pixmap(self.current_frame).scaled(
-                480, 360, Qt.AspectRatioMode.KeepAspectRatio
+                480, 320, Qt.AspectRatioMode.KeepAspectRatio
             )
         )
 
@@ -227,24 +252,42 @@ class ScleraApp(QWidget):
             self.captured = cv2.cvtColor(best, cv2.COLOR_BGR2RGB)
             self.preview_label.setPixmap(
                 np_to_pixmap(self.captured).scaled(
-                    480, 360, Qt.AspectRatioMode.KeepAspectRatio
+                    480, 320, Qt.AspectRatioMode.KeepAspectRatio
                 )
             )
             self.status_label.setText("Image captured (sharpest frame)")
 
     def load_image(self):
+        # ✅ pause camera so dialog doesn't feel "hung"
+        self.pause_camera()
+
         fname, _ = QFileDialog.getOpenFileName(
-            self, "Load Image", "", "Images (*.jpg *.png *.jpeg)"
+            self, "Load Image", os.getcwd(), "Images (*.jpg *.png *.jpeg)"
         )
-        if fname:
-            img = cv2.cvtColor(cv2.imread(fname), cv2.COLOR_BGR2RGB)
-            self.captured = img
-            self.preview_label.setPixmap(
-                np_to_pixmap(img).scaled(
-                    480, 360, Qt.AspectRatioMode.KeepAspectRatio
-                )
+
+        # ✅ resume camera no matter what
+        try:
+            self.resume_camera()
+        except Exception:
+            pass
+
+        if not fname:
+            self.status_label.setText("❌ No file selected")
+            return
+
+        img_bgr = cv2.imread(fname)
+        if img_bgr is None:
+            self.status_label.setText("❌ Failed to read image")
+            return
+
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        self.captured = img
+        self.preview_label.setPixmap(
+            np_to_pixmap(img).scaled(
+                480, 320, Qt.AspectRatioMode.KeepAspectRatio
             )
-            self.status_label.setText("Image loaded")
+        )
+        self.status_label.setText("Image loaded")
 
     # =====================================================
     # API CALLS
@@ -292,11 +335,18 @@ class ScleraApp(QWidget):
             return
 
         best = matches[0]
+        user = best.get("user_id", "Unknown")
+        eye = best.get("eye_side", "?")
+        sample = best.get("sample", "")
+        sim = best.get("similarity", 0.0)
+
         self.status_label.setText(
-            f"BEST MATCH: {best['name']} | Similarity: {best['similarity']:.3f}"
+            f"BEST MATCH: {user} ({eye})\n"
+            f"Sample: {sample}\n"
+            f"Similarity: {sim:.3f}"
         )
 
-        self.log_record("MATCH", best["name"], best["similarity"])
+        self.log_record("MATCH", user, sim)
 
     # =====================================================
     # TAB 2 — RECORDS

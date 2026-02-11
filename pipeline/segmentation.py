@@ -32,7 +32,7 @@ def extract_focused_veins(img_rgb):
     Extracts only the prominent veins from the clean central sclera region.
     """
     h, w = img_rgb.shape[:2]
-    roi = sclera_roi(img_rgb, height_ratio=0.35)
+    roi = sclera_roi(img_rgb, height_ratio=0.8)
 
     gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
     gray = cv2.bilateralFilter(gray, 7, 75, 75)

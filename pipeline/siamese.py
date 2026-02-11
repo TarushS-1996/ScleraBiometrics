@@ -109,6 +109,77 @@ def compare_processed_eye(
         "label": label
     }
 
+def identify_processed_eye_across_database_nested(
+    processed_query_img: np.ndarray,
+    base_dir: str,
+    threshold: float = 0.58
+):
+    """
+    Compare a processed sclera image against ALL stored processed images
+    inside a nested folder structure:
+
+      base_dir/user_id/eye_side/sample_XXX.png
+
+    Assumptions:
+    - processed_query_img is already (256,256,3) RGB, uint8
+    - stored images are also processed outputs saved as PNG
+    """
+
+    processed_query_img = cv2.resize(processed_query_img, (256, 256))
+    Xq = np.expand_dims(processed_query_img.astype(np.float32), axis=0)
+
+    results = []
+
+    # Walk user/eye/sample structure
+    for user_id in sorted(os.listdir(base_dir)):
+        user_path = os.path.join(base_dir, user_id)
+        if not os.path.isdir(user_path):
+            continue
+
+        for eye_side in sorted(os.listdir(user_path)):
+            eye_path = os.path.join(user_path, eye_side)
+            if not os.path.isdir(eye_path):
+                continue
+
+            for fname in sorted(os.listdir(eye_path)):
+                if not fname.endswith(".png"):
+                    continue
+
+                path = os.path.join(eye_path, fname)
+                stored_bgr = cv2.imread(path)
+                if stored_bgr is None:
+                    continue
+
+                stored_rgb = cv2.cvtColor(stored_bgr, cv2.COLOR_BGR2RGB)
+                stored_rgb = cv2.resize(stored_rgb, (256, 256))
+                if stored_rgb.shape != (256, 256, 3):
+                    continue
+
+                Xs = np.expand_dims(stored_rgb.astype(np.float32), axis=0)
+
+                dist = float(siamese_model.predict([Xq, Xs], verbose=0)[0][0])
+                similarity = 1.0 - dist
+
+                results.append({
+                    "user_id": user_id,
+                    "eye_side": eye_side,
+                    "sample": fname,
+                    "path": path,
+                    "distance": dist,
+                    "similarity": similarity,
+                    "label": "SAME" if similarity >= threshold else "DIFFERENT"
+                })
+
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+
+    return {
+        "threshold": threshold,
+        "best_match": results[0] if results else None,
+        "matches": [r for r in results if r["label"] == "SAME"],
+        "all_results": results
+    }
+
+
 def identify_processed_eye_across_database(
     processed_query_img: np.ndarray,
     processed_dir: str,
