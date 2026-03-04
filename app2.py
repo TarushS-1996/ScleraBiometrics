@@ -40,6 +40,28 @@ COLORS = {
     'grid_line': '#1a3d5c'
 }
 
+
+import json
+
+def fetch_logs_from_stream(api_url: str) -> list[dict]:
+    """
+    Fetch and parse the streamed JSONL log from /logs/stream.
+    Processes line-by-line so memory stays flat even for large files.
+    """
+    logs = []
+    with requests.get(f"{api_url}/logs/stream", stream=True) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if line:
+                try:
+                    logs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # skip malformed lines
+
+    # Already sorted descending server-side, but enforce here too
+    logs.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    return logs
+
 # -------------------------
 # Utils
 # -------------------------
@@ -759,6 +781,7 @@ class ScleraApp(QWidget):
 
         return tab
     
+    
     def create_panel(self, title):
         """Create a styled panel with title"""
         panel = QFrame()
@@ -965,7 +988,11 @@ class ScleraApp(QWidget):
         try:
             r = requests.post(f"{API_BASE}/segment", files=files, data=data, timeout=10)
             
-            self.log_record("REGISTER", user, 1.0 if r.status_code == 200 else 0.0)
+            self.log_record(
+                    "REGISTER", user, 1.0,
+                    eye_side=eye,
+                    sample=response_data.get("sample", "--")
+                )
             
             if r.status_code == 200:
                 response_data = r.json()
@@ -1107,12 +1134,89 @@ class ScleraApp(QWidget):
     # =====================================================
     # TAB 2 — RECORDS
     # =====================================================
+    def populate_records_from_logs(self):
+        try:
+            logs = fetch_logs_from_stream(API_BASE)
+        except Exception as e:
+            print(f"[Records] Could not load logs on startup: {e}")
+            return
+
+        for entry in logs:
+            action_type = entry.get("action", "")
+            ts_raw = entry.get("timestamp", "")
+
+            # Normalise timestamp display
+            try:
+                ts = datetime.fromisoformat(ts_raw).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts = ts_raw
+
+            if action_type == "new_user":
+                self._insert_log_row(
+                    ts       = ts,
+                    action   = "REGISTER",
+                    user_id  = entry.get("user_id", "--"),
+                    eye_side = entry.get("eye_side", "--"),
+                    sample   = entry.get("sample", "--"),
+                    sim      = None
+                )
+            elif action_type == "match":
+                matched   = entry.get("matched", False)
+                action_label = "MATCH ✓" if matched else "MATCH ✗"
+                sim = entry.get("best_match_similarity")
+                self._insert_log_row(
+                    ts       = ts,
+                    action   = action_label,
+                    user_id  = entry.get("best_match_user_id") or "--",
+                    eye_side = entry.get("best_match_eye_side") or "--",
+                    sample   = entry.get("best_match_sample") or "--",
+                    sim      = sim
+                )
+
+    def _insert_log_row(self, ts, action, user_id, eye_side, sample, sim):
+        """Low-level row builder — appends to bottom (used during bulk load)."""
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        ts_item     = QTableWidgetItem(ts)
+        action_item = QTableWidgetItem(action)
+        user_item   = QTableWidgetItem(user_id)
+        eye_item    = QTableWidgetItem(eye_side)
+        sample_item = QTableWidgetItem(sample)
+
+        ts_item.setForeground(QColor(COLORS['text_muted']))
+
+        if action == "REGISTER":
+            action_item.setForeground(QColor(COLORS['success']))
+        elif action == "MATCH ✓":
+            action_item.setForeground(QColor(COLORS['success']))
+        else:
+            action_item.setForeground(QColor(COLORS['error']))
+
+        if sim is None:
+            sim_item = QTableWidgetItem("--")
+            sim_item.setForeground(QColor(COLORS['text_muted']))
+        else:
+            sim_item = QTableWidgetItem(f"{sim:.3f}")
+            if sim >= 0.75:
+                sim_item.setForeground(QColor(COLORS['success']))
+            elif sim >= 0.5:
+                sim_item.setForeground(QColor(COLORS['accent_cyan']))
+            else:
+                sim_item.setForeground(QColor(COLORS['error']))
+
+        self.table.setItem(row, 0, ts_item)
+        self.table.setItem(row, 1, action_item)
+        self.table.setItem(row, 2, user_item)
+        self.table.setItem(row, 3, eye_item)
+        self.table.setItem(row, 4, sample_item)
+        self.table.setItem(row, 5, sim_item)
+        
     def records_tab(self):
         tab = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Header
+
         header = QLabel("SYSTEM LOGS - SCAN HISTORY")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header.setStyleSheet(f"""
@@ -1129,13 +1233,11 @@ class ScleraApp(QWidget):
         """)
         header.setFixedHeight(70)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(
-            ["⬡ TIME", "⬡ ACTION", "⬡ USER / MATCH", "⬡ CONFIDENCE"]
-        )
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        self.table = QTableWidget(0, 6)  # expanded to 6 columns
+        self.table.setHorizontalHeaderLabels([
+            "⬡ TIMESTAMP", "⬡ ACTION", "⬡ USER ID", "⬡ EYE SIDE", "⬡ SAMPLE", "⬡ SIMILARITY"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setStyleSheet(f"""
             QTableWidget {{
                 background-color: {COLORS['bg_panel']};
@@ -1166,35 +1268,60 @@ class ScleraApp(QWidget):
             }}
         """)
         self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
 
         layout.addWidget(header)
         layout.addWidget(self.table)
         tab.setLayout(layout)
         return tab
 
-    def log_record(self, action, name, similarity):
-        row = self.table.rowCount()
-        self.table.insertRow(row)
+    def log_record(self, action: str, user_id: str, similarity: float,
+                eye_side: str = "--", sample: str = "--"):
+        """
+        Insert a new record at the TOP of the table (newest first).
+        action: 'REGISTER' or 'MATCH'
+        """
+        self.table.insertRow(0)  # always insert at top
 
-        time_item = QTableWidgetItem(datetime.now().strftime("%H:%M:%S"))
+        # Timestamp
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts_item = QTableWidgetItem(ts)
+        ts_item.setForeground(QColor(COLORS['text_muted']))
+
+        # Action label + color
         action_item = QTableWidgetItem(action)
-        name_item = QTableWidgetItem(name)
-        sim_item = QTableWidgetItem(f"{similarity:.3f}")
-
-        # Color code similarity
-        if similarity >= 0.8:
-            sim_item.setForeground(QColor(COLORS['success']))
-        elif similarity >= 0.5:
-            sim_item.setForeground(QColor(COLORS['accent_cyan']))
+        if action == "REGISTER":
+            action_item.setForeground(QColor(COLORS['success']))
+        elif action == "MATCH ✓":
+            action_item.setForeground(QColor(COLORS['success']))
+        elif action == "MATCH ✗":
+            action_item.setForeground(QColor(COLORS['error']))
         else:
-            sim_item.setForeground(QColor(COLORS['error']))
+            action_item.setForeground(QColor(COLORS['accent_cyan']))
 
-        self.table.setItem(row, 0, time_item)
-        self.table.setItem(row, 1, action_item)
-        self.table.setItem(row, 2, name_item)
-        self.table.setItem(row, 3, sim_item)
-        
-        self.table.scrollToBottom()
+        user_item  = QTableWidgetItem(user_id  or "--")
+        eye_item   = QTableWidgetItem(eye_side or "--")
+        sample_item = QTableWidgetItem(sample  or "--")
+
+        # Similarity cell — blank for registrations
+        if action == "REGISTER":
+            sim_item = QTableWidgetItem("--")
+            sim_item.setForeground(QColor(COLORS['text_muted']))
+        else:
+            sim_item = QTableWidgetItem(f"{similarity:.3f}")
+            if similarity >= 0.75:
+                sim_item.setForeground(QColor(COLORS['success']))
+            elif similarity >= 0.5:
+                sim_item.setForeground(QColor(COLORS['accent_cyan']))
+            else:
+                sim_item.setForeground(QColor(COLORS['error']))
+
+        self.table.setItem(0, 0, ts_item)
+        self.table.setItem(0, 1, action_item)
+        self.table.setItem(0, 2, user_item)
+        self.table.setItem(0, 3, eye_item)
+        self.table.setItem(0, 4, sample_item)
+        self.table.setItem(0, 5, sim_item)
 
 
 # =====================================================
@@ -1215,5 +1342,7 @@ if __name__ == "__main__":
         global win
         win = ScleraApp()
         win.show()
+        # Populate records after window is visible — non-blocking 100ms delay
+        QTimer.singleShot(100, win.populate_records_from_logs)
     
     sys.exit(app.exec())

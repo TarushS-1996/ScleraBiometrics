@@ -12,7 +12,7 @@ from skimage import img_as_float
 # --------------------------------------------
 # Load Models
 # --------------------------------------------
-SIAMESE_WEIGHTS_PATH = "Model/siamese_model_trained.weights.h5"
+SIAMESE_WEIGHTS_PATH = "Model/alt_siamese_model_trained.weights.h5"
 
 # rebuild siamese and load weights
 def build_sclera_siamese(input_shape=(256,256,3)):
@@ -101,7 +101,7 @@ def compare_processed_eye(
 
     dist = float(siamese_model.predict([X1, X2], verbose=0)[0][0])
     similarity = 1.0 - dist
-    label = "SAME" if similarity >= 0.6 else "DIFFERENT"
+    label = "SAME" if dist >= 0.6 else "DIFFERENT"
 
     return {
         "distance": dist,
