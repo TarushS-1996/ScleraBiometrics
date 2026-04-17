@@ -310,7 +310,7 @@ async def segment_endpoint(
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid image")
 
-    processed = predict_sclera_and_vessels(img, plot=False)
+    processed, seg_mask = predict_sclera_and_vessels(img, plot=False)
 
     user_eye_dir = os.path.join(STORAGE_DIR, user_id, eye_side)
     os.makedirs(user_eye_dir, exist_ok=True)
@@ -334,7 +334,7 @@ async def segment_endpoint(
     })
 
     processed_base64 = encode_image_to_base64(processed)
-
+    seg_mask_base64 = encode_image_to_base64(seg_mask)
     return {
         "message": "Sample stored successfully",
         "user_id": user_id,
@@ -344,6 +344,7 @@ async def segment_endpoint(
         "sample": fname,
         "total_samples": sample_id,
         "processed_image": processed_base64,
+        "segmentation_mask": seg_mask_base64,
     }
 
 

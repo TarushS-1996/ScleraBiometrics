@@ -140,4 +140,4 @@ def predict_sclera_and_vessels(image_path, save_dir="results",
         plt.tight_layout()
         plt.show()
     
-    return final_out
+    return final_out, mask_resized
