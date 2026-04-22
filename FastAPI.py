@@ -24,6 +24,12 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 os.makedirs("storage", exist_ok=True)
 
 
+@app.get("/liveness_check")
+async def liveness_check():
+    """Return a simple liveness signal for health checks."""
+    return {"ok": True}
+
+
 # =========================================================
 # JSONL AUDIT LOG HELPERS
 # =========================================================
