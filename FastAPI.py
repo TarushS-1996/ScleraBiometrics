@@ -340,7 +340,10 @@ async def segment_endpoint(
     })
 
     processed_base64 = encode_image_to_base64(processed)
-    seg_mask_base64 = encode_image_to_base64(seg_mask)
+    _, buffer = cv2.imencode('.png', seg_mask)
+    seg_mask_base64 = base64.b64encode(buffer).decode('utf-8')
+    print(f"Stored new sample for user_id='{user_id}', eye_side='{eye_side}', sample='{fname}'")
+    print("Encode processed image and segmentation mask to base64 for response.")
     return {
         "message": "Sample stored successfully",
         "user_id": user_id,
@@ -393,7 +396,7 @@ async def identify_eye(
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid image")
 
-    processed = predict_sclera_and_vessels(img, plot=False)
+    processed, mask = predict_sclera_and_vessels(img, plot=False)
 
     result = identify_processed_eye_across_database_nested(
         processed_query_img=processed,
