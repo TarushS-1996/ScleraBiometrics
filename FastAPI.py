@@ -340,8 +340,8 @@ async def segment_endpoint(
     })
 
     processed_base64 = encode_image_to_base64(processed)
-    _, buffer = cv2.imencode('.png', seg_mask)
-    seg_mask_base64 = base64.b64encode(buffer).decode('utf-8')
+    # _, buffer = cv2.imencode('.png', seg_mask)
+    # seg_mask_base64 = base64.b64encode(buffer).decode('utf-8')
     print(f"Stored new sample for user_id='{user_id}', eye_side='{eye_side}', sample='{fname}'")
     print("Encode processed image and segmentation mask to base64 for response.")
     return {
@@ -353,7 +353,7 @@ async def segment_endpoint(
         "sample": fname,
         "total_samples": sample_id,
         "processed_image": processed_base64,
-        "segmentation_mask": seg_mask_base64,
+        "segmentation_mask": processed_base64,  # For demonstration, returning the same image as mask
     }
 
 
