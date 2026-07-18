@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
 import os
@@ -8,20 +9,36 @@ import json
 import uuid
 import shutil
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 from fastapi.responses import StreamingResponse
 from pipeline.segmentation import *
 from pipeline.siamese import *
+from pipeline.liveness import EyeLivenessDetector
 
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 STORAGE_DIR = "storage/segmented"
 LOG_FILE = "storage/audit_log.jsonl"
 
 os.makedirs(STORAGE_DIR, exist_ok=True)
 os.makedirs("storage", exist_ok=True)
+
+liveness_detector = EyeLivenessDetector()
 
 
 @app.get("/liveness_check")
@@ -82,6 +99,171 @@ def encode_image_to_base64(img_rgb: np.ndarray) -> str:
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     _, buffer = cv2.imencode('.png', img_bgr)
     return base64.b64encode(buffer).decode('utf-8')
+
+
+def encode_gray_mask_to_base64(mask: np.ndarray) -> str:
+    _, buffer = cv2.imencode('.png', mask)
+    return base64.b64encode(buffer).decode('utf-8')
+
+
+def decode_upload_to_bgr(image_file: UploadFile) -> np.ndarray:
+    img_bytes = image_file.file.read()
+    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Invalid image")
+    return img
+
+
+def serialize_liveness_result(result: dict) -> dict:
+    metrics = result.get("metrics", {})
+    center = metrics.get("center")
+    bbox = metrics.get("bbox")
+
+    return {
+        "pupil_class_id": result.get("pupil_class_id"),
+        "confidence": result.get("confidence"),
+        "used_fallback": result.get("used_fallback"),
+        "metrics": {
+            "area_px": metrics.get("area_px", 0),
+            "diameter_px": metrics.get("diameter_px", 0.0),
+            "center": list(center) if center is not None else None,
+            "bbox": list(bbox) if bbox is not None else None,
+        },
+        "segmentation_mask": encode_gray_mask_to_base64(result["segmentation_mask"]),
+        "pupil_mask": encode_gray_mask_to_base64(result["pupil_mask"]),
+        "pupil_overlay": base64.b64encode(cv2.imencode('.png', result["pupil_overlay_bgr"])[1]).decode('utf-8'),
+    }
+
+
+# =========================================================
+# LIVENESS API — single endpoint, multi-check pipeline
+# =========================================================
+
+@app.post("/liveness")
+async def liveness_endpoint(
+    images: List[UploadFile] = File(...),
+    change_threshold_ratio: float = Form(0.08),
+):
+    """
+    Unified liveness endpoint.
+
+    Flow:
+      1) Receive one or many images
+      2) Segment each image first (inside liveness detector)
+      3) Run pupil-based liveness
+      4) Run vein-flow liveness check placeholder
+
+    Behavior:
+      - 1 image: returns per-image pupil result only
+      - 2+ images: also returns pupil dilation comparisons
+    """
+    if change_threshold_ratio < 0.0:
+        raise HTTPException(status_code=400, detail="change_threshold_ratio must be >= 0")
+    if not images:
+        raise HTTPException(status_code=400, detail="At least one image is required")
+
+    print(
+        "[liveness-hit]",
+        json.dumps(
+            {
+                "count": len(images),
+                "filenames": [img.filename for img in images],
+                "threshold": change_threshold_ratio,
+            },
+            ensure_ascii=True,
+        ),
+    )
+
+    decoded_frames: List[np.ndarray] = []
+    image_names: List[str] = []
+    for image in images:
+        img_bytes = await image.read()
+        frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise HTTPException(status_code=400, detail=f"Invalid image: {image.filename or 'unknown'}")
+        decoded_frames.append(frame)
+        image_names.append(image.filename or "image")
+
+    # Step 1 + 2: segmentation-first pupil liveness for each image
+    per_image_results = []
+    for idx, frame in enumerate(decoded_frames):
+        res = liveness_detector.process_for_liveness(frame)
+        serialized = serialize_liveness_result(res)
+        serialized["index"] = idx
+        serialized["filename"] = image_names[idx]
+        per_image_results.append(serialized)
+
+    # Pupil dilation checks when multiple images are provided
+    dilation = {
+        "available": len(decoded_frames) >= 2,
+        "threshold": change_threshold_ratio,
+        "first_to_last": None,
+        "pairwise": [],
+    }
+
+    if len(decoded_frames) >= 2:
+        first_last = liveness_detector.assess_pupil_dilation(
+            baseline_bgr=decoded_frames[0],
+            probe_bgr=decoded_frames[-1],
+            change_threshold_ratio=change_threshold_ratio,
+        )
+        dilation["first_to_last"] = {
+            "from_index": 0,
+            "to_index": len(decoded_frames) - 1,
+            "status": first_last.get("status"),
+            "diameter_change_ratio": first_last.get("diameter_change_ratio"),
+            "reason": first_last.get("reason"),
+        }
+
+        for i in range(1, len(decoded_frames)):
+            pair = liveness_detector.assess_pupil_dilation(
+                baseline_bgr=decoded_frames[i - 1],
+                probe_bgr=decoded_frames[i],
+                change_threshold_ratio=change_threshold_ratio,
+            )
+            dilation["pairwise"].append({
+                "from_index": i - 1,
+                "to_index": i,
+                "status": pair.get("status"),
+                "diameter_change_ratio": pair.get("diameter_change_ratio"),
+                "reason": pair.get("reason"),
+            })
+
+    # Vein-flow liveness placeholder (next phase)
+    vein_flow = liveness_detector.detect_vein_flow_change(decoded_frames)
+
+    payload = {
+        "endpoint": "/liveness",
+        "input_count": len(decoded_frames),
+        "message": "Only one image; can't determine liveness." if len(decoded_frames) == 1 else "Liveness analysis complete.",
+        "pipeline": [
+            "receive_images",
+            "segment_images",
+            "pupil_liveness_check",
+            "vein_flow_liveness_check",
+        ],
+        "pupil": {
+            "per_image": per_image_results,
+            "dilation": dilation,
+        },
+        "vein_flow": vein_flow,
+    }
+
+    print(
+        "[liveness-output]",
+        json.dumps(
+            {
+                "input_count": payload["input_count"],
+                "message": payload["message"],
+                "dilation_available": payload["pupil"]["dilation"]["available"],
+                "first_to_last": payload["pupil"]["dilation"]["first_to_last"],
+                "vein_flow": payload["vein_flow"],
+            },
+            ensure_ascii=True,
+        ),
+    )
+
+    return JSONResponse(content=payload)
 
 
 # =========================================================
@@ -340,8 +522,8 @@ async def segment_endpoint(
     })
 
     processed_base64 = encode_image_to_base64(processed)
-    # _, buffer = cv2.imencode('.png', seg_mask)
-    # seg_mask_base64 = base64.b64encode(buffer).decode('utf-8')
+    _, buffer = cv2.imencode('.png', seg_mask)
+    seg_mask_base64 = base64.b64encode(buffer).decode('utf-8')
     print(f"Stored new sample for user_id='{user_id}', eye_side='{eye_side}', sample='{fname}'")
     print("Encode processed image and segmentation mask to base64 for response.")
     return {
@@ -353,7 +535,7 @@ async def segment_endpoint(
         "sample": fname,
         "total_samples": sample_id,
         "processed_image": processed_base64,
-        "segmentation_mask": processed_base64,  # For demonstration, returning the same image as mask
+        "segmentation_mask": seg_mask_base64,
     }
 
 
