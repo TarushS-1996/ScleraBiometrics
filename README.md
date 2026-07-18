@@ -29,17 +29,7 @@ uvicorn FastAPI:app --host 0.0.0.0 --port 8000 --reload
 Backend should be available at:
 - http://127.0.0.1:8000
 
-Quick health check (optional):
 
-```bash
-curl http://127.0.0.1:8000/liveness_check
-```
-
-Expected response:
-
-```json
-{"ok": true}
-```
 
 ## 2. Start Frontend (Second)
 
