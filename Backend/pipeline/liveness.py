@@ -1,8 +1,10 @@
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from skimage import img_as_float
+from skimage.filters import frangi
 
 from pipeline.segmentation import seg_model
 
@@ -11,9 +13,9 @@ class EyeLivenessDetector:
 	"""
 	Liveness detector for eye images.
 
-	Current features:
-	1) Pupil detection from segmentation-first pipeline (implemented)
-	2) Vein-flow based liveness (scaffold only)
+	Features:
+	1) Vessel-based liveness: multi-frame blood-flow temporal analysis (PRIMARY)
+	2) Pupil dilation liveness: multi-frame pupil size comparison (FALLBACK)
 	"""
 
 	def __init__(
@@ -281,21 +283,236 @@ class EyeLivenessDetector:
 			"probe": probe,
 		}
 
-	def detect_vein_flow_change(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+	# ----------------------------------------------------------------
+	# Vessel-based liveness  (blood-flow temporal analysis)
+	# ----------------------------------------------------------------
+
+	def _extract_vessel_contrast_ratio(
+		self,
+		image_rgb: np.ndarray,
+		sclera_mask: np.ndarray,
+	) -> Optional[float]:
 		"""
-		Placeholder for future liveness feature:
-		detect subtle vessel changes tied to blood flow dynamics.
+		Compute mean(vessel px intensity) / mean(non-vessel sclera px intensity)
+		for one frame.
+
+		Why a ratio and not raw variance:
+		  Camera shake moves ALL sclera pixels together, keeping this ratio
+		  stable.  Only actual blood flow changes vessel pixel brightness
+		  independently of the background, making the temporal std of this
+		  ratio a reliable live-vs-spoof discriminator.
 		"""
+		if np.count_nonzero(sclera_mask) < 500:
+			return None
+
+		gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+		gray_norm = cv2.normalize(
+			gray, None, 0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F
+		)
+
+		# Frangi vesselness -- run only inside sclera region to avoid
+		# noise from surrounding skin / lash regions.
+		sclera_float = np.where(sclera_mask > 0, gray_norm, 0.0).astype(np.float32)
+		v = frangi(img_as_float(sclera_float), sigmas=range(1, 4))
+		v = np.nan_to_num(v, nan=0.0)
+		v_norm = cv2.normalize(
+			v.astype(np.float32), None, 0.0, 1.0, cv2.NORM_MINMAX
+		)
+
+		# Adaptive vessel threshold: pixels above mean + 0.35 * std
+		sclera_px = v_norm[sclera_mask > 0]
+		mean_v = float(np.mean(sclera_px))
+		std_v = float(np.std(sclera_px))
+		vessel_threshold = mean_v + 0.35 * std_v
+
+		vessel_mask = (v_norm > vessel_threshold) & (sclera_mask > 0)
+		background_mask = (sclera_mask > 0) & ~vessel_mask
+
+		if np.count_nonzero(vessel_mask) < 50 or np.count_nonzero(background_mask) < 50:
+			return None
+
+		vessel_mean = float(np.mean(gray[vessel_mask]))
+		bg_mean = float(np.mean(gray[background_mask]))
+
+		if bg_mean < 1.0:
+			return None
+
+		return vessel_mean / bg_mean
+
+	def _vein_fallback_pupil(self, frames: List[np.ndarray]) -> Dict[str, Any]:
+		"""Fall back to pupil dilation when vessel analysis is inconclusive."""
+		if len(frames) < 2:
+			return {
+				"implemented": True,
+				"status": "unknown",
+				"liveness": None,
+				"message": "Vein-flow inconclusive; insufficient frames for pupil fallback.",
+				"fallback_used": True,
+				"fallback_reason": "single_frame",
+			}
+		try:
+			dilation = self.assess_pupil_dilation(frames[0], frames[-1])
+			pd_status = dilation.get("status", "unknown")
+			liveness = pd_status in ("dilated", "constricted")
+			ratio = dilation.get("diameter_change_ratio")
+			change_str = (
+				f" (change={ratio:.4f})" if isinstance(ratio, float) else ""
+			)
+			return {
+				"implemented": True,
+				"status": f"pupil_{pd_status}",
+				"liveness": liveness,
+				"message": (
+					f"Vein-flow inconclusive; pupil fallback: {pd_status}{change_str}."
+				),
+				"fallback_used": True,
+				"fallback_reason": None,
+				"pupil_dilation": {
+					"status": pd_status,
+					"diameter_change_ratio": ratio,
+				},
+			}
+		except Exception as exc:
+			return {
+				"implemented": True,
+				"status": "error",
+				"liveness": None,
+				"message": f"Both vein-flow and pupil fallback failed: {exc}",
+				"fallback_used": True,
+				"fallback_reason": "exception",
+			}
+
+	def detect_vein_flow_change(self, frames: Any, **kwargs: Any) -> Dict[str, Any]:
+		"""
+		Multi-frame blood-vessel liveness detection.
+
+		Algorithm:
+		  Per frame:
+		    1. Segment -> sclera mask  (class == 1 from seg model)
+		    2. Frangi vesselness on sclera pixels -> vessel map
+		    3. vessel_contrast_ratio = mean(vessel px) / mean(background sclera px)
+		  Across frames:
+		    4. temporal_variance = std(contrast_ratios)
+		       - Live:  blood flow changes vessel brightness independently
+		                -> temporal_variance > LIVE_THRESHOLD  (0.005)
+		       - Spoof: static image, no biology
+		                -> temporal_variance < SPOOF_THRESHOLD (0.001)
+		       - Borderline -> automatic pupil dilation fallback
+		"""
+		# Accept list/tuple of BGR frames (API usage) or single ndarray
+		if isinstance(frames, (list, tuple)):
+			frame_list = [f for f in frames if isinstance(f, np.ndarray)]
+		elif isinstance(frames, np.ndarray):
+			frame_list = [frames]
+		else:
+			frame_list = []
+
+		print(f"[vein-flow] called with {len(frame_list)} frame(s)")
+
+		if len(frame_list) < 2:
+			return {
+				"implemented": True,
+				"status": "insufficient_frames",
+				"liveness": None,
+				"message": "Need at least 2 frames for vein-flow liveness.",
+				"frames_analyzed": len(frame_list),
+				"fallback_used": False,
+			}
+
+		contrast_ratios: List[float] = []
+		sclera_coverages: List[float] = []
+
+		for idx, frame in enumerate(frame_list):
+			try:
+				seg = self._segment_first(frame)
+				image_rgb = seg["image_rgb"]
+				class_mask = seg["class_mask"]
+
+				sclera_mask = (class_mask == 1).astype(np.uint8) * 255
+				coverage = float(np.count_nonzero(sclera_mask)) / float(sclera_mask.size)
+				sclera_coverages.append(coverage)
+
+				ratio = self._extract_vessel_contrast_ratio(image_rgb, sclera_mask)
+				if ratio is not None:
+					contrast_ratios.append(ratio)
+					print(
+						f"[vein-flow] frame {idx}: cov={coverage:.3f}"
+						f" ratio={ratio:.6f}"
+					)
+				else:
+					print(
+						f"[vein-flow] frame {idx}: cov={coverage:.3f}"
+						" vessel=None"
+					)
+			except Exception as exc:
+				print(f"[vein-flow] frame {idx} error: {exc}")
+
+		if len(contrast_ratios) < 2:
+			print(
+				f"[vein-flow] {len(contrast_ratios)} usable frame(s)"
+				" -- falling back to pupil dilation"
+			)
+			result = self._vein_fallback_pupil(frame_list)
+			result["fallback_reason"] = "insufficient_vessel_coverage"
+			return result
+
+		ratios = np.array(contrast_ratios, dtype=np.float64)
+		temporal_variance = float(np.std(ratios))
+		mean_ratio = float(np.mean(ratios))
+		max_frame_diff = float(np.max(np.abs(np.diff(ratios))))
+
+		LIVE_THRESHOLD = 0.005
+		SPOOF_THRESHOLD = 0.001
+
+		print(
+			f"[vein-flow] temporal_variance={temporal_variance:.7f}"
+			f"  mean_ratio={mean_ratio:.6f}"
+			f"  max_diff={max_frame_diff:.7f}"
+			f"  usable={len(contrast_ratios)}/{len(frame_list)}"
+		)
+
+		if temporal_variance < SPOOF_THRESHOLD:
+			status, liveness = "spoof_detected", False
+			message = (
+				f"Near-zero vessel contrast variation (std={temporal_variance:.7f});"
+				" likely static image."
+			)
+		elif temporal_variance >= LIVE_THRESHOLD:
+			status, liveness = "live", True
+			message = (
+				f"Vessel contrast temporal variation detected"
+				f" (std={temporal_variance:.7f}); live tissue confirmed."
+			)
+		else:
+			print(
+				f"[vein-flow] borderline variance={temporal_variance:.7f}"
+				" -- falling back to pupil dilation"
+			)
+			result = self._vein_fallback_pupil(frame_list)
+			result["fallback_reason"] = "borderline_vessel_variance"
+			result["vein_temporal_variance"] = temporal_variance
+			result["vein_mean_contrast_ratio"] = mean_ratio
+			return result
+
+		print(f"[vein-flow] result: {status}  liveness={liveness}")
+
 		return {
-			"implemented": False,
-			"message": "Vein-flow liveness detection is not implemented yet.",
+			"implemented": True,
+			"status": status,
+			"liveness": liveness,
+			"message": message,
+			"temporal_variance": temporal_variance,
+			"mean_contrast_ratio": mean_ratio,
+			"max_frame_diff": max_frame_diff,
+			"frames_analyzed": len(contrast_ratios),
+			"total_frames": len(frame_list),
+			"mean_sclera_coverage": (
+				float(np.mean(sclera_coverages)) if sclera_coverages else 0.0
+			),
+			"fallback_used": False,
 		}
 
 	def process_for_liveness(self, image_bgr: np.ndarray) -> Dict[str, Any]:
-		"""
-		Explicit two-step liveness flow:
-		1) segmentation model pass
-		2) pupil liveness process
-		"""
+		"""Single-image path: segment then detect pupil."""
 		return self.detect_pupil(image_bgr)
 
